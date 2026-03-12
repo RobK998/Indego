@@ -1,6 +1,8 @@
 """Bosch Indego Mower integration."""
 from typing import Optional
 import asyncio
+import math
+import os
 import logging
 from datetime import datetime, timedelta
 from aiohttp.client_exceptions import ClientResponseError
@@ -195,6 +197,29 @@ ENTITY_DEFINITIONS = {
     },
     ENTITY_LAWN_MOWER: {
         CONF_TYPE: LAWN_MOWER_TYPE,
+    },
+    ENTITY_MOWER_SVG_X: {
+        CONF_TYPE: SENSOR_TYPE,
+        CONF_NAME: "mower position x",
+        CONF_ICON: "mdi:map-marker",
+        CONF_DEVICE_CLASS: None,
+        CONF_UNIT_OF_MEASUREMENT: "px",
+        CONF_ATTR: [],
+    },
+    ENTITY_MOWER_SVG_Y: {
+        CONF_TYPE: SENSOR_TYPE,
+        CONF_NAME: "mower position y",
+        CONF_ICON: "mdi:map-marker",
+        CONF_DEVICE_CLASS: None,
+        CONF_UNIT_OF_MEASUREMENT: "px",
+        CONF_ATTR: [],
+    },
+    ENTITY_MOWER_STUCK: {
+        CONF_TYPE: BINARY_SENSOR_TYPE,
+        CONF_NAME: "mower stuck",
+        CONF_ICON: "mdi:alert-circle-outline",
+        CONF_DEVICE_CLASS: BinarySensorDeviceClass.PROBLEM,
+        CONF_ATTR: ["stuck_since", "stuck_x", "stuck_y"],
     },
 }
 
