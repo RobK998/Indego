@@ -435,6 +435,11 @@ class IndegoHub:
         self._latest_alert = None
         self.entities = {}
         self._update_fail_count = None
+        self._last_position_change_time = None
+        self._last_svg_x = None
+        self._last_svg_y = None
+        self._map_svg = None
+        self._map_trail = []
 
         async def async_token_refresh() -> str:
             await session.async_ensure_token_valid()
@@ -759,6 +764,49 @@ class IndegoHub:
 
         if ENTITY_LAWN_MOWER in self.entities:
             self.entities[ENTITY_LAWN_MOWER].indego_state = self._indego_client.state.state
+            # Position tracking and stuck detection
+        
+        # Position tracking and stuck detection
+        svg_x = self._indego_client.state.svg_xPos
+        svg_y = self._indego_client.state.svg_yPos
+
+        if svg_x is not None and svg_y is not None:
+            if ENTITY_MOWER_SVG_X in self.entities:
+                self.entities[ENTITY_MOWER_SVG_X].state = svg_x
+            if ENTITY_MOWER_SVG_Y in self.entities:
+                self.entities[ENTITY_MOWER_SVG_Y].state = svg_y
+
+            is_mowing = 500 <= self._indego_client.state.state <= 799
+            now = datetime.now()
+
+            moved = self._last_svg_x is None or math.sqrt(
+                (svg_x - self._last_svg_x) ** 2 + (svg_y - self._last_svg_y) ** 2
+            ) > 5
+
+            if moved:
+                self._last_svg_x = svg_x
+                self._last_svg_y = svg_y
+                self._last_position_change_time = now
+
+            stuck = (
+                is_mowing
+                and self._last_position_change_time is not None
+                and (now - self._last_position_change_time).total_seconds() > 60
+            )
+
+            if ENTITY_MOWER_STUCK in self.entities:
+                self.entities[ENTITY_MOWER_STUCK].state = stuck
+                if stuck:
+                    self.entities[ENTITY_MOWER_STUCK].add_attributes({
+                        "stuck_since": self._last_position_change_time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "stuck_x": svg_x,
+                        "stuck_y": svg_y,
+                    })
+
+            if is_mowing:
+                self._map_trail.append((svg_x, svg_y))
+
+            self._hass.async_create_task(self._update_map_svg(svg_x, svg_y))
 
     async def _update_generic_data(self):
         await self._indego_client.update_generic_data()
