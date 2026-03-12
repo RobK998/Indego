@@ -901,3 +901,38 @@ class IndegoHub:
     @property
     def client(self) -> IndegoAsyncClient:
         return self._indego_client
+        
+    async def _update_map_svg(self, current_x: int, current_y: int):
+        """Fetch SVG map once and overlay mower trail, saving to www."""
+        try:
+            if self._map_svg is None:
+                _LOGGER.debug("Fetching SVG map from Bosch API")
+                self._map_svg = await self._indego_client.get_map()
+
+            if not self._map_svg:
+                return
+
+            trail_points = " ".join(f"{x},{y}" for x, y in self._map_trail[-500:])
+            overlay = ""
+            if len(self._map_trail) > 1:
+                overlay += (
+                    f'<polyline points="{trail_points}" fill="none" '
+                    f'stroke="#2196F3" stroke-width="3" stroke-opacity="0.7" '
+                    f'stroke-linecap="round" stroke-linejoin="round"/>'
+                )
+            overlay += (
+                f'<circle cx="{current_x}" cy="{current_y}" r="8" '
+                f'fill="#F44336" stroke="white" stroke-width="2"/>'
+            )
+
+            annotated = self._map_svg.replace("</svg>", f"{overlay}</svg>")
+
+            www_path = self._hass.config.path("www")
+            os.makedirs(www_path, exist_ok=True)
+            map_path = os.path.join(www_path, f"indego_map_{self._serial}.svg")
+
+            with open(map_path, "w") as f:
+                f.write(annotated)
+
+        except Exception as exc:
+            _LOGGER.warning("Failed to update Indego map SVG: %s", str(exc))
