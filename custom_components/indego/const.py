@@ -62,3 +62,7 @@ HTTP_HEADER_USER_AGENT_DEFAULTS: Final = [
     "HomeAssistant/Indego",
     "HA/Indego"
 ]
+
+ENTITY_MOWER_SVG_X: Final = "mower_svg_x"
+ENTITY_MOWER_SVG_Y: Final = "mower_svg_y"
+ENTITY_MOWER_STUCK: Final = "mower_stuck"
