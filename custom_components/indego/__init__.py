@@ -3,6 +3,7 @@ from typing import Optional
 import asyncio
 import math
 import os
+import json
 import logging
 from datetime import datetime, timedelta
 from aiohttp.client_exceptions import ClientResponseError
@@ -431,6 +432,7 @@ class IndegoHub:
         self._refresh_state_task = None
         self._refresh_10m_remover = None
         self._refresh_24h_remover = None
+        self._fast_poll_task = None
         self._shutdown = False
         self._latest_alert = None
         self.entities = {}
@@ -439,7 +441,23 @@ class IndegoHub:
         self._last_svg_x = None
         self._last_svg_y = None
         self._map_svg = None
-        self._map_trail = []
+        self._sessions = self._load_trail()
+        # Restore last session as current so it stays bright green after restart
+        self._current_session = self._sessions[-1] if self._sessions else None
+        self._was_mowing = False
+        self._stuck_positions = self._load_stuck()
+        self._was_stuck = False
+        self._map_svg = self._load_base_map()
+        # Regenerate annotated map on startup from last known position
+        if self._sessions:
+            last_session = self._sessions[-1]
+            if last_session and last_session.get('points'):
+                last_x, last_y = last_session['points'][-1]
+                self._hass.loop.call_soon(
+                    lambda: self._hass.async_create_task(
+                        self._update_map_svg(last_x, last_y)
+                    )
+                )
 
         async def async_token_refresh() -> str:
             await session.async_ensure_token_valid()
@@ -565,6 +583,10 @@ class IndegoHub:
             await self._refresh_state_task
             self._refresh_state_task = None
 
+        if self._fast_poll_task:
+            self._fast_poll_task.cancel()
+            self._fast_poll_task = None
+
         if self._refresh_10m_remover:
             self._refresh_10m_remover()
 
@@ -621,6 +643,46 @@ class IndegoHub:
                     _LOGGER.warning("Mower alerts update failed, reason: %s", str(exc))
 
         await self._create_refresh_state_task()
+
+    async def _fast_poll_loop(self):
+        """Poll position every 3 seconds while mowing, without longpoll."""
+        import asyncio
+        _LOGGER.debug("Indego: fast poll loop started")
+        try:
+            while True:
+                await asyncio.sleep(3)
+                if self._shutdown:
+                    break
+                try:
+                    await self._indego_client.update_state(longpoll=False)
+                    if self._indego_client.state:
+                        svg_x = self._indego_client.state.svg_xPos
+                        svg_y = self._indego_client.state.svg_yPos
+                        if svg_x is not None and svg_y is not None:
+                            if ENTITY_MOWER_SVG_X in self.entities:
+                                self.entities[ENTITY_MOWER_SVG_X].state = svg_x
+                            if ENTITY_MOWER_SVG_Y in self.entities:
+                                self.entities[ENTITY_MOWER_SVG_Y].state = svg_y
+                            is_mowing = 500 <= self._indego_client.state.state <= 799
+                            if not is_mowing:
+                                _LOGGER.debug("Indego: fast poll loop stopping, no longer mowing")
+                                break
+                            # Append to trail
+                            if self._current_session is not None:
+                                pts = self._current_session.get('points', [])
+                                last = pts[-1] if pts else None
+                                if last is None or abs(svg_x - last[0]) > 2 or abs(svg_y - last[1]) > 2:
+                                    self._current_session['points'].append([svg_x, svg_y])
+                                    if not self._sessions or self._sessions[-1] is not self._current_session:
+                                        self._sessions.append(self._current_session)
+                                    self._sessions = self._sessions[-4:]
+                                    self._save_trail()
+                            self._hass.async_create_task(self._update_map_svg(svg_x, svg_y))
+                except Exception as exc:
+                    _LOGGER.debug("Indego fast poll error: %s", str(exc))
+        except Exception:
+            pass
+        _LOGGER.debug("Indego: fast poll loop ended")
 
     async def _create_refresh_state_task(self, event=None):
         """Create a task to refresh the mower state."""
@@ -719,6 +781,12 @@ class IndegoHub:
             return  # State update failed
 
         self.set_online_state(self._indego_client.online)
+        is_mowing_state = 500 <= self._indego_client.state.state <= 799
+        if is_mowing_state and (self._fast_poll_task is None or self._fast_poll_task.done()):
+            self._fast_poll_task = self._hass.async_create_task(self._fast_poll_loop())
+        elif not is_mowing_state and self._fast_poll_task and not self._fast_poll_task.done():
+            self._fast_poll_task.cancel()
+            self._fast_poll_task = None
         self.entities[ENTITY_MOWER_STATE].state = self._indego_client.state_description
         self.entities[ENTITY_MOWER_STATE_DETAIL].state = self._indego_client.state_description_detail
         self.entities[ENTITY_LAWN_MOWED].state = self._indego_client.state.mowed
@@ -802,10 +870,62 @@ class IndegoHub:
                         "stuck_x": svg_x,
                         "stuck_y": svg_y,
                     })
+                    if not self._was_stuck and self._current_session and len(self._current_session['points']) > 40:
+                        self._current_session['stuck'].append([svg_x, svg_y])
+                        if len(self._current_session['stuck']) > 10:
+                            self._current_session['stuck'] = self._current_session['stuck'][-10:]
+                        self._save_trail()
+            self._was_stuck = stuck
 
             if is_mowing:
-                self._map_trail.append((svg_x, svg_y))
-
+                if not self._was_mowing:
+                    cur_points = len(self._current_session['points']) if self._current_session else 0
+                    if self._current_session and cur_points > 5:
+                        # Genuinely new mow - start new session
+                        from datetime import datetime as _dt
+                        next_id = (self._sessions[-1]['id'] + 1) if self._sessions else 1
+                        self._current_session = {"id": next_id, "started": _dt.now().isoformat(), "points": [], "stuck": []}
+                        _LOGGER.debug('Indego: new mowing session %d started', next_id)
+                    elif not self._current_session:
+                        from datetime import datetime as _dt
+                        self._current_session = {"id": 1, "started": _dt.now().isoformat(), "points": [], "stuck": []}
+                        _LOGGER.debug('Indego: starting fresh mowing session')
+                    else:
+                        _LOGGER.debug('Indego: resuming mowing session %d with %d points', self._current_session['id'], cur_points)
+                    # Check if garden map has been updated
+                    try:
+                        if self._indego_client.state.map_update_available:
+                            _LOGGER.debug('Indego: map update available, refreshing base map')
+                            www_path = self._hass.config.path("www")
+                            svg_path = os.path.join(www_path, f"indego_base_{self._serial}.svg")
+                            if os.path.exists(svg_path):
+                                os.remove(svg_path)
+                            self._map_svg = None
+                    except Exception:
+                        pass
+                self._current_session['points'].append([svg_x, svg_y])
+                if not self._sessions or self._sessions[-1] is not self._current_session:
+                    self._sessions.append(self._current_session)
+                self._sessions = self._sessions[-4:]
+                self._save_trail()
+            elif self._was_mowing and not is_mowing:
+                async def _delayed_map_refresh():
+                    import asyncio as _asyncio
+                    await _asyncio.sleep(120)
+                    try:
+                        www_path = self._hass.config.path('www')
+                        svg_path = os.path.join(www_path, f'indego_base_{self._serial}.svg')
+                        _LOGGER.debug('Indego: refreshing base map after mow completed')
+                        await self._indego_client.download_map(filename=svg_path)
+                        with open(svg_path, 'r') as mf:
+                            self._map_svg = mf.read()
+                        last_x = self._last_svg_x or svg_x
+                        last_y = self._last_svg_y or svg_y
+                        await self._update_map_svg(last_x, last_y)
+                    except Exception as exc:
+                        _LOGGER.debug('Indego: post-mow map refresh failed: %s', exc)
+                self._hass.async_create_task(_delayed_map_refresh())
+            self._was_mowing = is_mowing
             self._hass.async_create_task(self._update_map_svg(svg_x, svg_y))
 
     async def _update_generic_data(self):
@@ -902,37 +1022,160 @@ class IndegoHub:
     def client(self) -> IndegoAsyncClient:
         return self._indego_client
         
+    def _load_base_map(self):
+        """Load base SVG map from disk if available."""
+        try:
+            www_path = self._hass.config.path("www")
+            svg_path = os.path.join(www_path, f"indego_base_{self._serial}.svg")
+            if os.path.exists(svg_path):
+                with open(svg_path, "r") as f:
+                    data = f.read()
+                    _LOGGER.debug("Loaded base map from disk, len=%s", len(data))
+                    return data
+        except Exception as exc:
+            _LOGGER.warning("Failed to load base map: %s", exc)
+        return None
+
+    def _load_trail(self) -> list:
+        """Load persisted sessions from disk."""
+        try:
+            path = self._hass.config.path(f"indego_trail_{self._serial}.json")
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    data = json.load(f)
+                    if data and isinstance(data[0], list):
+                        _LOGGER.warning("Indego: migrating old trail format")
+                        data = [{"id": i+1, "started": "", "points": s, "stuck": []} for i, s in enumerate(data)]
+                    _LOGGER.debug("Loaded %d sessions from disk", len(data))
+                    return data
+        except Exception as exc:
+            _LOGGER.warning("Failed to load trail: %s", exc)
+        return []
+
+    def _save_trail(self):
+        """Persist sessions to disk, keeping last 4."""
+        try:
+            path = self._hass.config.path(f"indego_trail_{self._serial}.json")
+            with open(path, "w") as f:
+                json.dump(self._sessions[-4:], f)
+        except Exception as exc:
+            _LOGGER.warning("Failed to save trail: %s", exc)
+
+    def _load_stuck(self) -> list:
+        """No longer used - stuck points stored per session."""
+        return []
+
+    def _save_stuck(self):
+        """No longer used - stuck points stored per session."""
+        pass
+
     async def _update_map_svg(self, current_x: int, current_y: int):
-        """Fetch SVG map once and overlay mower trail, saving to www."""
+        """Fetch SVG map once and overlay session trails and stuck markers."""
         try:
             if self._map_svg is None:
-                _LOGGER.debug("Fetching SVG map from Bosch API")
-                self._map_svg = await self._indego_client.get_map()
-
+                try:
+                    www_path = self._hass.config.path("www")
+                    os.makedirs(www_path, exist_ok=True)
+                    svg_path = os.path.join(www_path, f"indego_base_{self._serial}.svg")
+                    if not os.path.exists(svg_path):
+                        _LOGGER.debug("Downloading base map from Bosch API")
+                        await self._indego_client.download_map(filename=svg_path)
+                    if os.path.exists(svg_path):
+                        with open(svg_path, "r") as mf:
+                            self._map_svg = mf.read()
+                    else:
+                        return
+                except Exception as map_exc:
+                    _LOGGER.warning("Failed to download Indego map: %s %s", type(map_exc).__name__, str(map_exc))
+                    return
             if not self._map_svg:
                 return
 
-            trail_points = " ".join(f"{x},{y}" for x, y in self._map_trail[-500:])
-            overlay = ""
-            if len(self._map_trail) > 1:
-                overlay += (
-                    f'<polyline points="{trail_points}" fill="none" '
-                    f'stroke="#2196F3" stroke-width="3" stroke-opacity="0.7" '
-                    f'stroke-linecap="round" stroke-linejoin="round"/>'
-                )
-            overlay += (
-                f'<circle cx="{current_x}" cy="{current_y}" r="8" '
-                f'fill="#F44336" stroke="white" stroke-width="2"/>'
+            num_sessions = len(self._sessions)
+            overlay_parts = []
+
+            # Green shades from oldest (lightest) to newest (brightest)
+            # Each session gets its own distinct shade
+            session_colors = [
+                "#CCFF90",  # session -3 (oldest): very light green
+                "#B2FF59",  # session -2: light green  
+                "#69F0AE",  # session -1: medium green
+                "#00E676",  # session 0 (newest/current): bright green
+            ]
+
+            for s_idx, session in enumerate(self._sessions):
+                points = session['points']
+                stuck = session.get('stuck', [])
+                is_current = (s_idx == num_sessions - 1)
+
+                if len(points) < 2:
+                    continue
+
+                age = num_sessions - 1 - s_idx
+                opacity = 0.95 / (1.6 ** age)
+                stroke_width = max(18 - age * 2, 8)
+                color_idx = max(0, len(session_colors) - 1 - age)
+                stroke_color = session_colors[color_idx]
+
+                MAX_JUMP = 400
+                segments = []
+                current_seg = [points[0]]
+                for i in range(1, len(points)):
+                    dx = points[i][0] - points[i-1][0]
+                    dy = points[i][1] - points[i-1][1]
+                    dist = (dx*dx + dy*dy) ** 0.5
+                    if dist > MAX_JUMP:
+                        if len(current_seg) >= 2:
+                            segments.append(current_seg)
+                        current_seg = [points[i]]
+                    else:
+                        current_seg.append(points[i])
+                if len(current_seg) >= 2:
+                    segments.append(current_seg)
+
+                for seg in segments:
+                    pts = " ".join(f"{p[0]},{p[1]}" for p in seg)
+                    overlay_parts.append(
+                        f'<polyline points="{pts}" fill="none" '
+                        f'stroke="{stroke_color}" stroke-width="{stroke_width:.1f}" '
+                        f'stroke-opacity="{opacity:.2f}" '
+                        f'stroke-linecap="round" stroke-linejoin="round"/>'
+                    )
+
+                # Stuck markers for this session - same color family as session
+                for sx, sy in stuck:
+                    overlay_parts.append(
+                        f'<circle cx="{sx}" cy="{sy}" r="14" '
+                        f'fill="#FF6F00" fill-opacity="{opacity:.2f}" '
+                        f'stroke="#E65100" stroke-width="2"/>'
+                        f'<text x="{sx}" y="{sy+5}" text-anchor="middle" '
+                        f'font-size="14" font-weight="bold" fill="white" fill-opacity="{opacity:.2f}">!</text>'
+                    )
+
+            # Current position marker
+            overlay_parts.append(
+                f'<circle cx="{current_x}" cy="{current_y}" r="12" '
+                f'fill="#F44336" stroke="white" stroke-width="2.5"/>'
+                f'<circle cx="{current_x}" cy="{current_y}" r="5" fill="white"/>'
             )
 
-            annotated = self._map_svg.replace("</svg>", f"{overlay}</svg>")
+            overlay = "".join(overlay_parts)
+            annotated = self._map_svg[:self._map_svg.rfind("</svg>")] + f"{overlay}</svg>"
 
             www_path = self._hass.config.path("www")
             os.makedirs(www_path, exist_ok=True)
             map_path = os.path.join(www_path, f"indego_map_{self._serial}.svg")
-
             with open(map_path, "w") as f:
                 f.write(annotated)
+            # Write inline HTML version for cache-free display
+            html_path = os.path.join(www_path, f"indego_map_{self._serial}.html")
+            with open(html_path, "w") as f:
+                f.write(f'''<!DOCTYPE html>
+<html><head><style>
+body {{ margin: 0; background: transparent; overflow: hidden; }}
+svg {{ width: 100%; height: auto; display: block; }}
+</style></head><body>{annotated}</body></html>''')
 
         except Exception as exc:
             _LOGGER.warning("Failed to update Indego map SVG: %s", str(exc))
+
