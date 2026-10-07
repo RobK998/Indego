@@ -70,7 +70,6 @@ INDEGO_VACUUM_FEATURES = (
     VacuumEntityFeature.STATE
     | VacuumEntityFeature.PAUSE
     | VacuumEntityFeature.RETURN_HOME
-    | VacuumEntityFeature.BATTERY
     | VacuumEntityFeature.START
 )
 
